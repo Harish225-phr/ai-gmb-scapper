@@ -1,0 +1,1 @@
+web: gunicorn --timeout 120 --workers 3 --worker-class gthread --threads 2 --max-requests 1000 --keepalive 75 app:app
