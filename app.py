@@ -644,6 +644,14 @@ def _apply_websites_only_filter(result_data: dict, websites_only: bool) -> dict:
     updated["websites_only"] = True
     # Preserve original counts to help frontend decide on graceful fallback
     updated["original_total_results"] = original_total
+
+    # If website-only filtering removes everything, keep the original OSM results
+    # so users still see businesses instead of an empty page.
+    if original_total > 0 and len(filtered) == 0:
+        updated["results"] = rows
+        updated["total_results"] = original_total
+        updated["websites_only_fallback_applied"] = True
+
     return updated
 
 

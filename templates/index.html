@@ -912,6 +912,7 @@
 
         navigator.clipboard.writeText(text).then(() => {
             const btn = document.getElementById("copyAllBtn");
+            if (!btn) return;
             const originalText = btn.innerHTML;
             btn.innerHTML = '<i class="fas fa-check"></i> Copied!';
             setTimeout(() => {
