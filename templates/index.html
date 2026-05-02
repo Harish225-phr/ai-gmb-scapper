@@ -539,18 +539,6 @@
         currentLocation = location;
         nextPageToken = null;
 
-        try {
-            const response = await fetch("/search", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    keyword,
-                    location,
-                    search_mode: getSearchMode(),
-                    website_issue_only: false,
-                    websites_only: true,
-                })
-            });
         totalResultsCount = 0;  // Reset count for new search
 
         // Show loader
