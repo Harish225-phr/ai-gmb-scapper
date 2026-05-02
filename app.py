@@ -626,6 +626,7 @@ def _apply_websites_only_filter(result_data: dict, websites_only: bool) -> dict:
     if not isinstance(rows, list):
         return result_data
 
+    original_total = len(rows)
     filtered = []
     for r in rows:
         if not isinstance(r, dict):
@@ -641,6 +642,8 @@ def _apply_websites_only_filter(result_data: dict, websites_only: bool) -> dict:
     updated["results"] = filtered
     updated["total_results"] = len(filtered)
     updated["websites_only"] = True
+    # Preserve original counts to help frontend decide on graceful fallback
+    updated["original_total_results"] = original_total
     return updated
 
 
@@ -1100,6 +1103,7 @@ def search_multiple():
             all_results = {}
             for loc in location_list:
                 location, result_data = search_location(loc)
+                logger.info(f"Location '{location}': {len(result_data.get('results', []))} results before websites_only filter (websites_only={websites_only})")
                 result_data = _apply_websites_only_filter(result_data, websites_only)
                 all_results[location] = result_data
 
@@ -1127,6 +1131,7 @@ def search_multiple():
                 for future in as_completed(futures, timeout=90):  # 90 second limit to avoid worker timeout
                     try:
                         location, result_data = future.result()
+                        logger.info(f"Location '{location}': {len(result_data.get('results', []))} results before websites_only filter (websites_only={websites_only})")
                         result_data = _apply_websites_only_filter(result_data, websites_only)
                         all_results[location] = result_data
                     except Exception as e:
