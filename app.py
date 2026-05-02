@@ -1042,6 +1042,7 @@ def search_multiple():
         locations_str = request.json.get("locations", "").strip()
         use_expansion = request.json.get("use_expansion", False)
         fetch_websites = request.json.get("fetch_websites", True)
+        websites_only = bool(request.json.get("websites_only", False))
         search_mode = _normalize_search_mode(request.json)
         website_issue_only = bool(request.json.get("website_issue_only", False))
         
