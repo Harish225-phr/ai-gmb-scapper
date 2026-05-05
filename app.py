@@ -10,6 +10,7 @@ from scraper.lead_scraper import LeadScraperEngine
 from scraper.batch_processor import get_batch_processor
 from scraper.config import config
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import concurrent.futures
 import logging
 import json
 import sys
@@ -1108,14 +1109,37 @@ def search_multiple():
                 logger.error(f"Error searching {location}: {str(e)}")
                 return (location, {"error": str(e), "results": []})
 
-        # Run without_api sequentially to avoid public endpoint timeouts/partial returns.
+        # Run without_api in PARALLEL for speed (public APIs handle concurrency fine)
         if search_mode == "without_api":
             all_results = {}
-            for loc in location_list:
-                location, result_data = search_location(loc)
-                logger.info(f"Location '{location}': {len(result_data.get('results', []))} results before websites_only filter (websites_only={websites_only})")
-                result_data = _apply_websites_only_filter(result_data, websites_only)
-                all_results[location] = result_data
+            start_time = time.time()
+            
+            # Parallel execution with timeout management
+            safe_timeout = 60  # 60 second hard limit for public endpoints
+            max_workers = min(5, len(location_list))  # Max 5 concurrent requests
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(search_location, loc): loc for loc in location_list}
+                
+                try:
+                    for future in as_completed(futures, timeout=safe_timeout):
+                        try:
+                            location, result_data = future.result()
+                            logger.info(f"Location '{location}': {len(result_data.get('results', []))} results")
+                            result_data = _apply_websites_only_filter(result_data, websites_only)
+                            all_results[location] = result_data
+                        except Exception as e:
+                            loc_name = futures[future]
+                            log_error(f"Error for '{loc_name}': {str(e)}")
+                            all_results[loc_name] = {"error": str(e), "results": []}
+                        
+                        # Safety: if taking too long, still give partial results
+                        elapsed = time.time() - start_time
+                        if elapsed > 55:
+                            logger.warning(f"Public API search approaching timeout, returning partial results ({len(all_results)}/{len(location_list)})")
+                            break
+                except concurrent.futures.TimeoutError:
+                    logger.warning(f"Public API search timed out. Returning {len(all_results)}/{len(location_list)} results")
 
             response_data = {
                 "keyword": keyword,
