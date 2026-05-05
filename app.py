@@ -1021,6 +1021,8 @@ def search_multiple():
         fetch_websites = request.json.get("fetch_websites", True)
         search_mode = _normalize_search_mode(request.json)
         website_issue_only = bool(request.json.get("website_issue_only", False))
+        # Whether to return only website results
+        websites_only = bool(request.json.get("websites_only", False))
         
         if not keyword or not locations_str:
             return jsonify({"error": "Keyword and locations are required"}), 400
@@ -1090,17 +1092,19 @@ def search_multiple():
 
             return jsonify(response_data), 200
         
-        # Execute parallel searches with early timeout
+        # Execute parallel searches with an adaptive timeout to avoid worker process timeouts
         start_time = time.time()
         all_results = {}
-        
+
+        # Compute a safe timeout: at least 30s, but scale with per-request timeout and locations
+        safe_timeout = min(120, max(30, config.REQUEST_TIMEOUT * max(1, len(location_list)) + 10))
+        logger.info(f"Parallel search timeout set to {safe_timeout}s for {len(location_list)} locations")
+
         with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
-            futures = [
-                executor.submit(search_location, loc) for loc in location_list
-            ]
-            
+            futures = [executor.submit(search_location, loc) for loc in location_list]
+
             try:
-                for future in as_completed(futures, timeout=90):  # 90 second limit to avoid worker timeout
+                for future in as_completed(futures, timeout=safe_timeout):
                     try:
                         location, result_data = future.result()
                         result_data = _apply_websites_only_filter(result_data, websites_only)
@@ -1108,14 +1112,14 @@ def search_multiple():
                     except Exception as e:
                         log_error(f"Future error: {str(e)}")
                         continue
-                    
-                    # Safety check: if we're taking too long, warn and return early
+
+                    # Safety check: if we're taking too long, warn and return partial results
                     elapsed = time.time() - start_time
-                    if elapsed > 100:
+                    if elapsed > safe_timeout - 5:
                         logger.warning(f"Search is taking too long ({elapsed:.1f}s), returning partial results")
                         break
             except Exception as e:
-                log_error(f"Parallel search timeout: {str(e)}")
+                log_error(f"Parallel search timeout or error: {str(e)}")
                 logger.warning(f"Returning partial results. Completed: {len(all_results)}/{len(location_list)}")
         
         
