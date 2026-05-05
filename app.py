@@ -21,6 +21,7 @@ from threading import Lock
 import difflib
 
 import requests
+from werkzeug.exceptions import HTTPException
 
 # Setup logging
 logging.basicConfig(
@@ -109,9 +110,14 @@ def log_error(msg):
 
 def _normalize_search_mode(payload: dict) -> str:
     """Normalize requested search mode to supported values."""
-    mode = (payload or {}).get("search_mode", "with_api")
-    mode = str(mode).strip().lower()
-    return "without_api" if mode in {"without_api", "without-api", "no_api", "no-api"} else "with_api"
+    # If caller explicitly provided a search_mode, respect it (with common aliases).
+    explicit = (payload or {}).get("search_mode")
+    if explicit:
+        mode = str(explicit).strip().lower()
+        return "without_api" if mode in {"without_api", "without-api", "no_api", "no-api"} else "with_api"
+
+    # No explicit mode requested — choose a sensible default based on availability of API key.
+    return "with_api" if config.GOOGLE_API_KEY else "without_api"
 
 
 def _extract_website(tags: dict) -> str:
@@ -620,6 +626,7 @@ def _apply_websites_only_filter(result_data: dict, websites_only: bool) -> dict:
     if not isinstance(rows, list):
         return result_data
 
+    original_total = len(rows)
     filtered = []
     for r in rows:
         if not isinstance(r, dict):
@@ -635,6 +642,16 @@ def _apply_websites_only_filter(result_data: dict, websites_only: bool) -> dict:
     updated["results"] = filtered
     updated["total_results"] = len(filtered)
     updated["websites_only"] = True
+    # Preserve original counts to help frontend decide on graceful fallback
+    updated["original_total_results"] = original_total
+
+    # If website-only filtering removes everything, keep the original OSM results
+    # so users still see businesses instead of an empty page.
+    if original_total > 0 and len(filtered) == 0:
+        updated["results"] = rows
+        updated["total_results"] = original_total
+        updated["websites_only_fallback_applied"] = True
+
     return updated
 
 
@@ -642,6 +659,17 @@ def _apply_websites_only_filter(result_data: dict, websites_only: bool) -> dict:
 @app.errorhandler(Exception)
 def handle_error(error):
     """Catch all unhandled exceptions and return proper JSON error"""
+    # If this is an HTTPException (404, 405, etc.), return its status and message
+    if isinstance(error, HTTPException):
+        error_msg = error.description
+        log_error(f"HTTP error: {error_msg}")
+        response = jsonify({
+            "error": error_msg,
+            "code": error.code
+        })
+        response.headers['Content-Type'] = 'application/json'
+        return response, error.code
+
     error_msg = str(error)
     log_error(f"Unhandled exception: {error_msg}")
     import traceback
@@ -687,6 +715,12 @@ def health():
         },
         "warning": "Google API key not configured" if not api_key_configured else None
     }), 200
+
+
+@app.route('/favicon.ico')
+def favicon():
+    """Return no content for favicon to avoid 404 noise when no static file is provided."""
+    return ('', 204)
 
 
 @app.route("/")
@@ -1019,6 +1053,7 @@ def search_multiple():
         locations_str = request.json.get("locations", "").strip()
         use_expansion = request.json.get("use_expansion", False)
         fetch_websites = request.json.get("fetch_websites", True)
+        websites_only = bool(request.json.get("websites_only", False))
         search_mode = _normalize_search_mode(request.json)
         website_issue_only = bool(request.json.get("website_issue_only", False))
         # Whether to return only website results
@@ -1078,6 +1113,7 @@ def search_multiple():
             all_results = {}
             for loc in location_list:
                 location, result_data = search_location(loc)
+                logger.info(f"Location '{location}': {len(result_data.get('results', []))} results before websites_only filter (websites_only={websites_only})")
                 result_data = _apply_websites_only_filter(result_data, websites_only)
                 all_results[location] = result_data
 
@@ -1107,6 +1143,7 @@ def search_multiple():
                 for future in as_completed(futures, timeout=safe_timeout):
                     try:
                         location, result_data = future.result()
+                        logger.info(f"Location '{location}': {len(result_data.get('results', []))} results before websites_only filter (websites_only={websites_only})")
                         result_data = _apply_websites_only_filter(result_data, websites_only)
                         all_results[location] = result_data
                     except Exception as e:
