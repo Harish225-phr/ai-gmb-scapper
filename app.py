@@ -4,10 +4,12 @@ Production-grade API for lead generation with geo-grid expansion, caching, and d
 Enhanced with batch processing for free-tier stability.
 """
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, send_file
 from flask_cors import CORS
 from scraper.lead_scraper import LeadScraperEngine
 from scraper.batch_processor import get_batch_processor
+from scraper.website_enricher import enrich_results, get_cache_stats, clear_website_cache
+from scraper.maps_scraper import GoogleMapsScraper, scrape_multiple_locations
 from scraper.config import config
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import concurrent.futures
@@ -42,7 +44,9 @@ CORS(app, resources={
     r"/health": {"origins": "*"},
     r"/metrics": {"origins": "*"},
     r"/config": {"origins": "*"},
-    r"/cache/clear": {"origins": "*"}
+    r"/cache/clear": {"origins": "*"},
+    r"/enrichment/cache/stats": {"origins": "*"},
+    r"/enrichment/cache/clear": {"origins": "*"}
 })
 
 # Initialize lead scraper engine (global instance) with error handling
@@ -1109,37 +1113,65 @@ def search_multiple():
                 logger.error(f"Error searching {location}: {str(e)}")
                 return (location, {"error": str(e), "results": []})
 
-        # Run without_api in PARALLEL for speed (public APIs handle concurrency fine)
+        # Run without_api SEQUENTIALLY with enrichment (improved hybrid mode)
         if search_mode == "without_api":
             all_results = {}
             start_time = time.time()
             
-            # Parallel execution with timeout management
-            safe_timeout = 60  # 60 second hard limit for public endpoints
-            max_workers = min(5, len(location_list))  # Max 5 concurrent requests
+            # Check for enrichment settings
+            enable_enrichment = request.json.get("enable_enrichment", True)
+            max_enrichments_per_location = request.json.get("max_enrichments", 30)
             
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(search_location, loc): loc for loc in location_list}
-                
+            logger.info(f"Running hybrid OSM+enrichment search (enrichment={'ON' if enable_enrichment else 'OFF'})")
+            
+            for idx, location in enumerate(location_list):
                 try:
-                    for future in as_completed(futures, timeout=safe_timeout):
-                        try:
-                            location, result_data = future.result()
-                            logger.info(f"Location '{location}': {len(result_data.get('results', []))} results")
-                            result_data = _apply_websites_only_filter(result_data, websites_only)
-                            all_results[location] = result_data
-                        except Exception as e:
-                            loc_name = futures[future]
-                            log_error(f"Error for '{loc_name}': {str(e)}")
-                            all_results[loc_name] = {"error": str(e), "results": []}
+                    logger.info(f"[{idx + 1}/{len(location_list)}] Searching {location}...")
+                    
+                    # Search without_api (collect ALL results first, no strict website filtering)
+                    result_data = search_without_api(keyword, location, max_results=60)
+                    
+                    if result_data and result_data.get('results'):
+                        results = result_data['results']
+                        logger.info(f"  Found {len(results)} results from OSM")
                         
-                        # Safety: if taking too long, still give partial results
-                        elapsed = time.time() - start_time
-                        if elapsed > 55:
-                            logger.warning(f"Public API search approaching timeout, returning partial results ({len(all_results)}/{len(location_list)})")
-                            break
-                except concurrent.futures.TimeoutError:
-                    logger.warning(f"Public API search timed out. Returning {len(all_results)}/{len(location_list)} results")
+                        # Step 1: Enrich missing websites using Google search
+                        if enable_enrichment and len(results) > 0:
+                            try:
+                                logger.info(f"  Enriching websites for up to {max_enrichments_per_location} results...")
+                                results = enrich_results(
+                                    results, 
+                                    location,
+                                    max_enrichments=max_enrichments_per_location,
+                                    validate=False
+                                )
+                                result_data['results'] = results
+                                result_data['enrichment_applied'] = True
+                                logger.info(f"  Enrichment complete")
+                            except Exception as e:
+                                logger.warning(f"  Enrichment failed: {e} (keeping original results)")
+                                result_data['enrichment_applied'] = False
+                        
+                        # Step 2: Apply website filters if requested (after enrichment)
+                        result_data = _apply_websites_only_filter(result_data, websites_only)
+                        result_data = _apply_result_filters(result_data, website_issue_only)
+                    
+                    all_results[location] = result_data
+                    
+                    # Safety: if taking too long, skip remaining locations
+                    elapsed = time.time() - start_time
+                    if elapsed > 100:
+                        logger.warning(f"Search approaching timeout, skipping remaining locations")
+                        break
+                    
+                    # Add delay between locations to avoid rate limiting
+                    if idx < len(location_list) - 1:
+                        logger.info(f"  Waiting 3 seconds before next location...")
+                        time.sleep(3)
+                    
+                except Exception as e:
+                    logger.error(f"Error searching {location}: {str(e)}")
+                    all_results[location] = {"error": str(e), "results": []}
 
             response_data = {
                 "keyword": keyword,
@@ -1219,6 +1251,37 @@ def metrics():
     return jsonify(scraper_engine.get_metrics()), 200
 
 
+@app.route("/enrichment/cache/stats", methods=["GET"])
+def enrichment_cache_stats():
+    """Get website enrichment cache statistics."""
+    try:
+        stats = get_cache_stats()
+        return jsonify({
+            "cache_stats": stats,
+            "message": "Website enrichment cache statistics"
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to get cache stats",
+            "details": str(e) if config.DEBUG_MODE else None
+        }), 500
+
+
+@app.route("/enrichment/cache/clear", methods=["POST"])
+def enrichment_cache_clear():
+    """Clear website enrichment cache."""
+    try:
+        clear_website_cache()
+        return jsonify({
+            "message": "Website enrichment cache cleared successfully"
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to clear cache",
+            "details": str(e) if config.DEBUG_MODE else None
+        }), 500
+
+
 @app.route("/cache/clear", methods=["POST"])
 def clear_cache():
     """Clear all caches (admin endpoint)."""
@@ -1251,6 +1314,77 @@ def get_config():
         "api_key_configured": bool(config.GOOGLE_API_KEY),
         "search_modes": ["with_api", "without_api"],
     }), 200
+
+
+
+@app.route("/scrape-maps", methods=["POST"])
+def scrape_maps():
+    """
+    Scrape Google Maps for businesses using Playwright.
+    REAL data extraction with websites, ratings, reviews, phone, address.
+    
+    Request body:
+    {
+        "keyword": "restaurants",
+        "locations": ["Delhi", "Mumbai"],
+        "max_results": 50,
+        "headless": true
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        # Validation
+        keyword = data.get("keyword", "").strip()
+        locations_input = data.get("locations", [])
+        max_results = min(data.get("max_results", 50), 200)
+        headless = data.get("headless", True)
+        
+        if not keyword:
+            return jsonify({"error": "keyword required"}), 400
+        
+        if not locations_input:
+            return jsonify({"error": "locations required (list)"}), 400
+        
+        # Ensure locations is a list
+        if isinstance(locations_input, str):
+            locations = [loc.strip() for loc in locations_input.split(",")]
+        else:
+            locations = locations_input
+        
+        print(f"\n📍 Scraping request: {keyword} in {locations}")
+        
+        # Scrape
+        results_files = scrape_multiple_locations(
+            keyword=keyword,
+            locations=locations,
+            max_results=max_results,
+            headless=headless
+        )
+        
+        if not results_files:
+            return jsonify({
+                "error": "Scraping failed",
+                "keyword": keyword,
+                "locations": locations
+            }), 500
+        
+        # Return first file for download
+        filepath = results_files[0]
+        
+        return send_file(
+            filepath,
+            as_attachment=True,
+            download_name=filepath.name,
+            mimetype='text/csv'
+        )
+        
+    except Exception as e:
+        logger.error(f"Scraping error: {e}")
+        return jsonify({
+            "error": str(e),
+            "message": "Scraping failed"
+        }), 500
 
 
 if __name__ == "__main__":

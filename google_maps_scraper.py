@@ -9,6 +9,8 @@ import asyncio
 import csv
 import time
 import logging
+import random
+from urllib.parse import quote_plus
 from typing import List, Dict, Optional
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +48,11 @@ class GoogleMapsScraper:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.results: List[Dict] = []
+        self.current_location: str = ""
+
+    async def _pause(self, minimum_seconds: float = 1.0, maximum_seconds: float = 3.0) -> None:
+        """Pause for a jittered delay to reduce blocking risk."""
+        await asyncio.sleep(random.uniform(minimum_seconds, maximum_seconds))
         
     async def initialize(self):
         """Initialize Playwright browser and page."""
@@ -98,14 +105,17 @@ class GoogleMapsScraper:
         """
         try:
             search_query = f"{keyword} {location}"
-            url = f"https://www.google.com/maps/search/{search_query.replace(' ', '+')}"
+            url = f"https://www.google.com/maps/search/{quote_plus(search_query)}"
             logger.info(f"Opening Google Maps: {url}")
+
+            self.current_location = location
             
-            await self.page.goto(url, wait_until='networkidle', timeout=30000)
-            await asyncio.sleep(2)  # Wait for dynamic content
+            await self.page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            await self.page.wait_for_load_state('networkidle', timeout=30000)
+            await self._pause(2.0, 3.0)
             
             # Wait for results list to appear
-            await self.page.wait_for_selector('[role="region"] [role="button"]', timeout=15000)
+            await self.page.wait_for_selector('a.hfpxzc, [role="feed"]', timeout=15000)
             logger.info("Google Maps page loaded successfully")
             return True
             
@@ -128,17 +138,31 @@ class GoogleMapsScraper:
             max_scroll_attempts = 50
             
             logger.info("Starting to scroll results panel...")
-            
-            # Find the scrollable results container
-            results_container = await self.page.query_selector('[role="region"] [role="main"]')
-            if not results_container:
-                results_container = await self.page.query_selector('[role="region"]')
+
+            feed_selectors = [
+                '[role="feed"]',
+                'div[role="main"] [role="feed"]',
+                'div[aria-label*="Results for"]',
+                'div[role="main"]'
+            ]
+
+            feed_selector = None
+            for selector in feed_selectors:
+                try:
+                    if await self.page.query_selector(selector):
+                        feed_selector = selector
+                        break
+                except Exception:
+                    continue
+
+            if not feed_selector:
+                feed_selector = '[role="feed"]'
             
             while scroll_attempts < max_scroll_attempts and results_loaded < self.max_results:
                 try:
                     # Count current results
                     current_count = len(await self.page.query_selector_all(
-                        '[role="region"] [role="button"][jsaction*="click"]'
+                        'a.hfpxzc, [role="feed"] a[href*="/maps/place/"]'
                     ))
                     
                     results_loaded = current_count
@@ -153,23 +177,32 @@ class GoogleMapsScraper:
                         logger.info(f"Results loaded: {current_count}")
                     
                     # Scroll down using JavaScript for smooth scrolling
-                    await self.page.evaluate("""
-                        () => {
-                            const container = document.querySelector('[role="region"] [role="main"]');
+                    await self.page.evaluate(
+                        """
+                        (selector) => {
+                            const container = document.querySelector(selector);
                             if (container) {
                                 container.scrollTop = container.scrollHeight;
+                                container.dispatchEvent(new Event('scroll', { bubbles: true }));
+                            }
+                            const cards = Array.from(document.querySelectorAll('a.hfpxzc, [role="feed"] a[href*="/maps/place/"]'));
+                            const lastCard = cards[cards.length - 1];
+                            if (lastCard) {
+                                lastCard.scrollIntoView({ block: 'end', behavior: 'smooth' });
                             }
                         }
-                    """)
+                        """,
+                        feed_selector,
+                    )
                     
                     previous_count = current_count
                     scroll_attempts += 1
-                    await asyncio.sleep(1.5)  # Delay to avoid blocking
+                    await self._pause(1.0, 3.0)  # Delay to avoid blocking
                     
                 except Exception as e:
                     logger.warning(f"Error during scroll: {e}")
                     scroll_attempts += 1
-                    await asyncio.sleep(1)
+                    await self._pause(1.0, 2.0)
             
             logger.info(f"Scrolling complete. Total results loaded: {results_loaded}")
             return results_loaded
@@ -188,15 +221,18 @@ class GoogleMapsScraper:
         try:
             businesses = []
             
-            # Get all result buttons
+            # Get all result links
             result_buttons = await self.page.query_selector_all(
-                '[role="region"] [role="button"][jsaction*="click"]'
+                'a.hfpxzc, [role="feed"] a[href*="/maps/place/"]'
             )
             
             logger.info(f"Found {len(result_buttons)} result items")
             
             for idx, button in enumerate(result_buttons[:self.max_results]):
                 try:
+                    await button.scroll_into_view_if_needed(timeout=5000)
+                    await self._pause(1.0, 2.0)
+
                     # Extract text content
                     text_content = await button.text_content()
                     
@@ -214,6 +250,7 @@ class GoogleMapsScraper:
                         'rating': 'N/A',
                         'reviews': 'N/A',
                         'website': 'N/A',
+                        'location': self.current_location,
                         'element': button  # Keep reference for detail extraction
                     }
                     
@@ -230,6 +267,9 @@ class GoogleMapsScraper:
                     
                     businesses.append(business)
                     logger.debug(f"Extracted: {business['name']} - Rating: {business['rating']}")
+
+                    if len(businesses) >= self.max_results:
+                        break
                     
                 except Exception as e:
                     logger.warning(f"Error extracting result {idx}: {e}")
@@ -261,7 +301,7 @@ class GoogleMapsScraper:
             
             # Click on the business to open detail panel
             await element.click()
-            await asyncio.sleep(1.5)  # Wait for detail panel to load
+            await self._pause(1.5, 3.0)  # Wait for detail panel to load
             
             # Try multiple selectors for website link
             website_selectors = [
@@ -269,7 +309,8 @@ class GoogleMapsScraper:
                 'a[aria-label*="website"]',
                 'a[data-tooltip="Visit website"]',
                 'a[href*="www."]',
-                'div[role="button"][aria-label*="website"]'
+                'button[aria-label*="website"]',
+                'a[aria-label*="open website"]'
             ]
             
             website = None
@@ -328,7 +369,7 @@ class GoogleMapsScraper:
                         logger.info(f"Processed {idx + 1}/{len(self.results)} businesses")
                     
                     # Small delay between requests to avoid blocking
-                    await asyncio.sleep(0.5)
+                    await self._pause(1.0, 3.0)
                     
                 except Exception as e:
                     logger.warning(f"Error processing detail {idx}: {e}")
@@ -366,13 +407,14 @@ class GoogleMapsScraper:
                     'name': business.get('name', 'N/A'),
                     'rating': business.get('rating', 'N/A'),
                     'reviews': business.get('reviews', 'N/A'),
-                    'website': business.get('website', 'N/A')
+                    'website': business.get('website', 'N/A'),
+                    'location': business.get('location', self.current_location or 'N/A')
                 })
             
             # Write to CSV
             if csv_data:
                 with open(filepath, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.DictWriter(f, fieldnames=['name', 'rating', 'reviews', 'website'])
+                    writer = csv.DictWriter(f, fieldnames=['name', 'rating', 'reviews', 'website', 'location'])
                     writer.writeheader()
                     writer.writerows(csv_data)
                 

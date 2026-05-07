@@ -43,6 +43,11 @@ class AppConfig:
     FETCH_WEBSITES_BY_DEFAULT: bool = False  # Disabled by default to avoid timeouts - enable if needed
     WEBSITE_FETCH_TIMEOUT: int = 10  # seconds (reduced from 30)
     
+    # Website Enrichment (Google Search)
+    ENABLE_ENRICHMENT_BY_DEFAULT: bool = True  # Automatically enrich missing websites
+    MAX_ENRICHMENTS_PER_LOCATION: int = 30  # Limit enrichment to avoid timeouts
+    ENRICHMENT_CACHE_ENABLED: bool = True  # Cache found websites
+    
     # Logging
     DEBUG_MODE: bool = os.getenv("DEBUG_MODE", "False").lower() == "true"
 
